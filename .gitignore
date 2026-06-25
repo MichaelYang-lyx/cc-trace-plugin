@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+
+# 导出产物(别提交会话 trace)
+*_*/trace.jsonl
+*_*/report.md

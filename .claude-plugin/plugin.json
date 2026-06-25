@@ -1,0 +1,8 @@
+{
+  "name": "cc-trace",
+  "description": "导出 Claude Code 会话的 trace 与统计报告（token / 工具 / 耗时 / 成本）",
+  "version": "0.1.0",
+  "author": {
+    "name": "yangyibo1"
+  }
+}

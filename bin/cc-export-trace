@@ -1,0 +1,655 @@
+#!/usr/bin/env python3
+"""
+cc-export-trace — 把当前 Claude Code 会话导出为 trace.jsonl + report.md
+
+用法:
+    cc-export-trace                 # 自动找最近活跃的会话，导到 ./
+    cc-export-trace -o /some/dir    # 指定输出目录
+    cc-export-trace -s <session-id> # 指定会话 ID（jsonl 文件名前缀）
+    cc-export-trace --list          # 列出最近 10 个会话
+
+输出:
+    <out_dir>/<session-id>_<timestamp>/trace.jsonl
+    <out_dir>/<session-id>_<timestamp>/report.md
+"""
+from __future__ import annotations
+import argparse
+import json
+import os
+import sys
+from collections import defaultdict, Counter
+from datetime import datetime, timezone
+from pathlib import Path
+
+CC_PROJECTS = Path.home() / ".claude" / "projects"
+
+# 模型单价（美元 / 1M token）。缺失的模型会跳过成本估算。
+PRICING = {
+    "claude-opus-4-7":   {"input": 15.0, "output": 75.0, "cache_read": 1.5,  "cache_write_5m": 18.75, "cache_write_1h": 30.0},
+    "claude-opus-4-8":   {"input": 15.0, "output": 75.0, "cache_read": 1.5,  "cache_write_5m": 18.75, "cache_write_1h": 30.0},
+    "claude-sonnet-4-6": {"input": 3.0,  "output": 15.0, "cache_read": 0.3,  "cache_write_5m": 3.75,  "cache_write_1h": 6.0},
+    "claude-haiku-4-5":  {"input": 1.0,  "output": 5.0,  "cache_read": 0.1,  "cache_write_5m": 1.25,  "cache_write_1h": 2.0},
+}
+
+
+def normalize_model(m: str | None) -> str | None:
+    if not m:
+        return None
+    # 去掉 "anthropic/" 前缀
+    m = m.split("/")[-1].lower()
+    # 各种命名变体归一: claude-4.7-opus / claude-opus-4-7 / claude-opus-4-7-20260101
+    aliases = {
+        ("opus", "4-7"): "claude-opus-4-7", ("opus", "4.7"): "claude-opus-4-7",
+        ("opus", "4-8"): "claude-opus-4-8", ("opus", "4.8"): "claude-opus-4-8",
+        ("opus", "4-6"): "claude-opus-4-6", ("opus", "4.6"): "claude-opus-4-6",
+        ("sonnet", "4-6"): "claude-sonnet-4-6", ("sonnet", "4.6"): "claude-sonnet-4-6",
+        ("haiku", "4-5"): "claude-haiku-4-5", ("haiku", "4.5"): "claude-haiku-4-5",
+    }
+    for (fam, ver), canon in aliases.items():
+        if fam in m and ver in m:
+            return canon
+    for k in PRICING:
+        if m.startswith(k):
+            return k
+    return m
+
+
+def find_sessions():
+    """返回所有 (session_id, jsonl_path, mtime) 按 mtime 降序"""
+    out = []
+    if not CC_PROJECTS.exists():
+        return out
+    for proj in CC_PROJECTS.iterdir():
+        if not proj.is_dir():
+            continue
+        for f in proj.glob("*.jsonl"):
+            out.append((f.stem, f, f.stat().st_mtime))
+    out.sort(key=lambda x: -x[2])
+    return out
+
+
+def parse_ts(s):
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def fmt_duration(seconds):
+    if seconds is None:
+        return "n/a"
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def truncate(text, limit=500):
+    if not isinstance(text, str):
+        text = json.dumps(text, ensure_ascii=False)
+    if len(text.encode()) <= limit:
+        return text
+    enc = text.encode()
+    return enc[:limit].decode("utf-8", errors="ignore") + f"…[截断 {len(enc) - limit} 字节]"
+
+
+def percentile(values, p):
+    """简单的最近邻百分位，p in [0, 100]"""
+    if not values:
+        return 0
+    s = sorted(values)
+    k = max(0, min(len(s) - 1, int(round((p / 100.0) * (len(s) - 1)))))
+    return s[k]
+
+
+def fmt_bytes(n):
+    if n is None:
+        return "n/a"
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n / (1024 * 1024):.2f} MB"
+
+
+def summarize_args(tool, args):
+    """工具调用参数的一行摘要"""
+    if not isinstance(args, dict):
+        return ""
+    keys = ["file_path", "command", "path", "url", "pattern", "prompt", "subject", "query"]
+    for k in keys:
+        v = args.get(k)
+        if v:
+            return f"{k}={truncate(str(v), 80)}"
+    if args:
+        k = next(iter(args))
+        return f"{k}={truncate(str(args[k]), 80)}"
+    return ""
+
+
+def process(jsonl_path: Path, out_dir: Path):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    trace_path = out_dir / "trace.jsonl"
+    report_path = out_dir / "report.md"
+
+    events = []           # 归一化后的事件
+    tool_use_index = {}   # tool_use_id -> event idx
+    session_id = jsonl_path.stem
+    cwd = None
+    git_branch = None
+
+    first_ts = None
+    last_ts = None
+    # 记录每个 tool_use 的 input 字节数，用于配对到 tool_result 后做大小统计
+    tool_use_input_size = {}
+
+    with open(jsonl_path) as f, open(trace_path, "w") as tf:
+        for raw_line in f:
+            try:
+                d = json.loads(raw_line)
+            except Exception:
+                continue
+
+            t = d.get("type")
+            ts_str = d.get("timestamp")
+            ts = parse_ts(ts_str)
+            if ts:
+                if first_ts is None or ts < first_ts:
+                    first_ts = ts
+                if last_ts is None or ts > last_ts:
+                    last_ts = ts
+            cwd = d.get("cwd") or cwd
+            git_branch = d.get("gitBranch") or git_branch
+
+            if t == "user":
+                msg = d.get("message", {})
+                content = msg.get("content", "")
+                # tool_result 被包在 user 消息里
+                if isinstance(content, list):
+                    for c in content:
+                        if isinstance(c, dict) and c.get("type") == "tool_result":
+                            tu_id = c.get("tool_use_id")
+                            res_content = c.get("content", "")
+                            is_error = c.get("is_error", False)
+                            if isinstance(res_content, list):
+                                # 拼成纯文本
+                                parts = []
+                                for rc in res_content:
+                                    if isinstance(rc, dict):
+                                        parts.append(rc.get("text", ""))
+                                res_content = "\n".join(parts)
+                            ev = {
+                                "ts": ts_str,
+                                "type": "tool_result",
+                                "tool_call_id": tu_id,
+                                "ok": not is_error,
+                                "summary": truncate(str(res_content), 200),
+                                "result_bytes": len(str(res_content).encode("utf-8", errors="ignore")),
+                                "_size": len(str(res_content)),
+                                "_ts": ts,
+                            }
+                            events.append(ev)
+                            # 配对算耗时 + 关联 input_bytes
+                            if tu_id in tool_use_index:
+                                use_idx = tool_use_index[tu_id]
+                                use_ev = events[use_idx]
+                                if use_ev.get("_ts") and ts:
+                                    ev["duration_ms"] = int((ts - use_ev["_ts"]).total_seconds() * 1000)
+                                ev["tool"] = use_ev.get("tool")
+                                ev["input_bytes"] = tool_use_input_size.get(tu_id, 0)
+                else:
+                    text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+                    events.append({
+                        "ts": ts_str,
+                        "type": "user",
+                        "summary": truncate(text, 200),
+                        "_ts": ts,
+                    })
+
+            elif t == "assistant":
+                msg = d.get("message", {})
+                model = normalize_model(msg.get("model"))
+                usage = msg.get("usage") or {}
+                tokens = {
+                    "input": usage.get("input_tokens", 0),
+                    "output": usage.get("output_tokens", 0),
+                    "cache_read": usage.get("cache_read_input_tokens", 0),
+                    "cache_creation": usage.get("cache_creation_input_tokens", 0),
+                }
+                cache_detail = usage.get("cache_creation") or {}
+                tokens["cache_5m"] = cache_detail.get("ephemeral_5m_input_tokens", 0)
+                tokens["cache_1h"] = cache_detail.get("ephemeral_1h_input_tokens", 0)
+                # 上下文 size = 这一轮 assistant "看到" 的输入：input(未缓存) + cache_read + cache_creation
+                context_size = tokens["input"] + tokens["cache_read"] + tokens["cache_creation"]
+
+                content = msg.get("content", [])
+                first_text = ""
+                text_chars = 0
+                thinking_chars = 0
+                thinking_blocks = 0
+                redacted_thinking_blocks = 0
+                for c in content:
+                    if isinstance(c, dict):
+                        ct = c.get("type")
+                        if ct == "text":
+                            txt = c.get("text", "") or ""
+                            text_chars += len(txt)
+                            if not first_text:
+                                first_text = txt
+                        elif ct == "thinking":
+                            thinking_chars += len(c.get("thinking", "") or "")
+                            thinking_blocks += 1
+                        elif ct == "redacted_thinking":
+                            redacted_thinking_blocks += 1
+
+                events.append({
+                    "ts": ts_str,
+                    "type": "assistant",
+                    "model": model,
+                    "tokens": tokens,
+                    "context_size": context_size,
+                    "thinking_chars": thinking_chars,
+                    "thinking_blocks": thinking_blocks,
+                    "redacted_thinking_blocks": redacted_thinking_blocks,
+                    "text_chars": text_chars,
+                    "summary": truncate(first_text or "(tool use only)", 200),
+                    "_ts": ts,
+                })
+
+                # 拆出 tool_use
+                for c in content:
+                    if isinstance(c, dict) and c.get("type") == "tool_use":
+                        tu_id = c.get("id")
+                        tu_input = c.get("input", {})
+                        try:
+                            input_bytes = len(json.dumps(tu_input, ensure_ascii=False).encode("utf-8", errors="ignore"))
+                        except Exception:
+                            input_bytes = 0
+                        tool_use_input_size[tu_id] = input_bytes
+                        ev = {
+                            "ts": ts_str,
+                            "type": "tool_use",
+                            "tool": c.get("name"),
+                            "tool_call_id": tu_id,
+                            "input_bytes": input_bytes,
+                            "summary": f"{c.get('name')}({summarize_args(c.get('name'), tu_input)})",
+                            "_ts": ts,
+                        }
+                        events.append(ev)
+                        tool_use_index[tu_id] = len(events) - 1
+
+            elif t == "system":
+                events.append({
+                    "ts": ts_str,
+                    "type": "system",
+                    "summary": d.get("subtype", ""),
+                    "_ts": ts,
+                })
+
+    # 算 elapsed_ms 并写 trace.jsonl
+    with open(trace_path, "w") as tf:
+        for ev in events:
+            ets = ev.pop("_ts", None)
+            ev.pop("_size", None)
+            if ets and first_ts:
+                ev["elapsed_ms"] = int((ets - first_ts).total_seconds() * 1000)
+            else:
+                ev["elapsed_ms"] = None
+            # 字段顺序整一下
+            ordered = {k: ev[k] for k in ("ts", "elapsed_ms", "type") if k in ev}
+            for k, v in ev.items():
+                if k not in ordered:
+                    ordered[k] = v
+            tf.write(json.dumps(ordered, ensure_ascii=False) + "\n")
+
+    # 统计
+    wall = (last_ts - first_ts).total_seconds() if first_ts and last_ts else None
+    by_model_tokens = defaultdict(lambda: Counter())
+    assistant_turns = 0
+    user_turns = 0
+    tool_stats = defaultdict(lambda: {
+        "calls": 0, "ok": 0, "fail": 0,
+        "durations": [], "input_bytes": [], "output_bytes": [],
+        "fail_samples": [],
+    })
+    failed_tools = []
+    slowest = []  # (duration_ms, label, ev_index)
+    biggest_results = []  # (result_bytes, tool, ev_index)
+
+    # 上下文峰值
+    context_peak = 0
+    context_peak_turn = 0  # 第几轮 assistant
+    context_peak_ev_idx = -1
+
+    # 思考 / 非思考输出汇总（精确字符数；transcript 不透出 thinking_tokens，故不算 token）
+    total_thinking_chars = 0
+    total_text_chars = 0
+    total_thinking_blocks = 0
+    total_redacted_blocks = 0
+    turns_with_thinking = 0
+
+    # 每轮 assistant 时间线
+    turns_timeline = []   # list of dict: turn, ts, model, tokens, context_size, cumulative_*, tool_calls_in_turn, duration_ms
+    cum_tokens = Counter()
+    cum_cost = 0.0
+    last_assistant_ts = first_ts
+
+    # 用 tool_use_index 计数：在两个 assistant 事件之间的 tool_use 数量算到上一个 assistant 这一轮
+    last_assistant_idx = -1
+    tool_calls_per_turn = defaultdict(int)  # turn_idx (0-based assistant 序号) -> count
+
+    for i, ev in enumerate(events):
+        t = ev.get("type")
+        if t == "assistant":
+            assistant_turns += 1
+            m = ev.get("model") or "unknown"
+            for k, v in ev.get("tokens", {}).items():
+                by_model_tokens[m][k] += v or 0
+                cum_tokens[k] += v or 0
+            cs = ev.get("context_size", 0) or 0
+            if cs > context_peak:
+                context_peak = cs
+                context_peak_turn = assistant_turns
+                context_peak_ev_idx = i
+
+            # 思考/输出字符
+            tc = ev.get("thinking_chars", 0) or 0
+            xc = ev.get("text_chars", 0) or 0
+            tb = ev.get("thinking_blocks", 0) or 0
+            rb = ev.get("redacted_thinking_blocks", 0) or 0
+            total_thinking_chars += tc
+            total_text_chars += xc
+            total_thinking_blocks += tb
+            total_redacted_blocks += rb
+            if tb or rb:
+                turns_with_thinking += 1
+
+            # 本轮成本（按当前模型单价立刻算）
+            p = PRICING.get(m)
+            turn_cost = 0.0
+            if p:
+                toks = ev.get("tokens", {})
+                turn_cost = (
+                    toks.get("input", 0) * p["input"]
+                    + toks.get("output", 0) * p["output"]
+                    + toks.get("cache_read", 0) * p["cache_read"]
+                    + toks.get("cache_5m", 0) * p["cache_write_5m"]
+                    + toks.get("cache_1h", 0) * p["cache_write_1h"]
+                ) / 1_000_000
+            cum_cost += turn_cost
+
+            # 与上一条 assistant 的间隔（含用户思考时间，仅作参考）
+            ets = ev.get("_ts") or parse_ts(ev.get("ts"))
+            turn_dur_ms = None
+            if ets and last_assistant_ts:
+                turn_dur_ms = int((ets - last_assistant_ts).total_seconds() * 1000)
+            last_assistant_ts = ets
+
+            turns_timeline.append({
+                "turn": assistant_turns,
+                "ts": ev.get("ts"),
+                "model": m,
+                "tokens": dict(ev.get("tokens", {})),
+                "context_size": cs,
+                "cum_tokens": dict(cum_tokens),
+                "turn_cost_usd": turn_cost,
+                "cum_cost_usd": cum_cost,
+                "turn_dur_ms": turn_dur_ms,
+                "thinking_chars": tc,
+                "text_chars": xc,
+                "thinking_blocks": tb,
+                "redacted_thinking_blocks": rb,
+            })
+            last_assistant_idx = i
+        elif t == "user":
+            user_turns += 1
+        elif t == "tool_use":
+            tn = ev.get("tool") or "unknown"
+            tool_stats[tn]["calls"] += 1
+            ib = ev.get("input_bytes")
+            if ib is not None:
+                tool_stats[tn]["input_bytes"].append(ib)
+            if assistant_turns > 0:
+                tool_calls_per_turn[assistant_turns] += 1
+        elif t == "tool_result":
+            tn = ev.get("tool") or "unknown"
+            ob = ev.get("result_bytes")
+            if ob is not None:
+                tool_stats[tn]["output_bytes"].append(ob)
+                biggest_results.append((ob, tn, i + 1))
+            if ev.get("ok"):
+                tool_stats[tn]["ok"] += 1
+            else:
+                tool_stats[tn]["fail"] += 1
+                reason = ev.get("summary", "")[:160]
+                failed_tools.append((tn, reason, i + 1))
+                if len(tool_stats[tn]["fail_samples"]) < 3:
+                    tool_stats[tn]["fail_samples"].append(reason)
+            d = ev.get("duration_ms")
+            if d is not None:
+                tool_stats[tn]["durations"].append(d)
+                slowest.append((d, f"{tn}", i + 1))
+
+    slowest.sort(reverse=True)
+    slowest = slowest[:5]
+    biggest_results.sort(reverse=True)
+    biggest_results = biggest_results[:5]
+
+    # 把 tool_calls_per_turn 回填到 timeline
+    for t in turns_timeline:
+        t["tool_calls"] = tool_calls_per_turn.get(t["turn"], 0)
+
+    # 成本估算
+    total_cost = 0.0
+    cost_lines = []
+    for m, toks in by_model_tokens.items():
+        p = PRICING.get(m)
+        if not p:
+            cost_lines.append(f"- {m}: 无单价数据")
+            continue
+        c = (
+            toks["input"] * p["input"]
+            + toks["output"] * p["output"]
+            + toks["cache_read"] * p["cache_read"]
+            + toks["cache_5m"] * p["cache_write_5m"]
+            + toks["cache_1h"] * p["cache_write_1h"]
+        ) / 1_000_000
+        total_cost += c
+        cost_lines.append(f"- {m}: ${c:.4f}")
+
+    # 写 report.md
+    lines = []
+    lines.append(f"# 会话报告 — {session_id}\n")
+    lines.append("## 1. 总览\n")
+    lines.append(f"- **会话 ID**: `{session_id}`")
+    lines.append(f"- **工作目录**: `{cwd or 'n/a'}`")
+    lines.append(f"- **Git 分支**: `{git_branch or 'n/a'}`")
+    lines.append(f"- **开始**: {first_ts.isoformat() if first_ts else 'n/a'}")
+    lines.append(f"- **结束**: {last_ts.isoformat() if last_ts else 'n/a'}")
+    lines.append(f"- **总耗时**: {fmt_duration(wall)}")
+    lines.append(f"- **轮次**: user={user_turns}, assistant={assistant_turns}")
+    lines.append(f"- **模型**: {', '.join(by_model_tokens.keys()) or 'n/a'}")
+    lines.append(f"- **上下文峰值**: {context_peak:,} tokens（第 {context_peak_turn} 轮）")
+    lines.append(f"- **思考 / 输出字符**: {total_thinking_chars:,} / {total_text_chars:,}（思考块 {total_thinking_blocks}" + (f"，加密 {total_redacted_blocks}" if total_redacted_blocks else "") + f"）\n")
+
+    lines.append("## 2. Token 用量\n")
+    lines.append("| 模型 | Input | Output | Cache 读 | Cache 写(5m) | Cache 写(1h) | 合计 |")
+    lines.append("|------|------:|-------:|---------:|-------------:|-------------:|-----:|")
+    grand = Counter()
+    for m, toks in by_model_tokens.items():
+        total = toks["input"] + toks["output"] + toks["cache_read"] + toks["cache_5m"] + toks["cache_1h"]
+        lines.append(f"| {m} | {toks['input']:,} | {toks['output']:,} | {toks['cache_read']:,} | {toks['cache_5m']:,} | {toks['cache_1h']:,} | {total:,} |")
+        for k, v in toks.items():
+            grand[k] += v
+    grand_total = grand["input"] + grand["output"] + grand["cache_read"] + grand["cache_5m"] + grand["cache_1h"]
+    lines.append(f"| **合计** | {grand['input']:,} | {grand['output']:,} | {grand['cache_read']:,} | {grand['cache_5m']:,} | {grand['cache_1h']:,} | **{grand_total:,}** |\n")
+    lines.append(f"**估算成本**: ${total_cost:.4f}\n")
+    for cl in cost_lines:
+        lines.append(cl)
+    lines.append("")
+
+    lines.append("## 3. 工具调用\n")
+    if tool_stats:
+        lines.append("| 工具 | 次数 | 成功 | 失败 | 错误率 | min/p50/p95/max (ms) | 平均 (ms) | 总耗时 (ms) | 输入(总) | 输出(总) |")
+        lines.append("|------|----:|----:|----:|------:|---------------------:|----------:|------------:|---------:|---------:|")
+        for tn, s in sorted(tool_stats.items(), key=lambda x: -x[1]["calls"]):
+            durs = s["durations"]
+            total_d = sum(durs)
+            avg = int(total_d / len(durs)) if durs else 0
+            mn = int(min(durs)) if durs else 0
+            mx = int(max(durs)) if durs else 0
+            p50 = int(percentile(durs, 50))
+            p95 = int(percentile(durs, 95))
+            err_rate = (s["fail"] / s["calls"] * 100.0) if s["calls"] else 0.0
+            in_total = sum(s["input_bytes"])
+            out_total = sum(s["output_bytes"])
+            lines.append(
+                f"| {tn} | {s['calls']} | {s['ok']} | {s['fail']} | {err_rate:.1f}% | "
+                f"{mn:,}/{p50:,}/{p95:,}/{mx:,} | {avg:,} | {total_d:,} | "
+                f"{fmt_bytes(in_total)} | {fmt_bytes(out_total)} |"
+            )
+        lines.append("")
+        if failed_tools:
+            lines.append("**失败的调用**（按工具分组）:")
+            by_tool_fail = defaultdict(list)
+            for tn, reason, ln in failed_tools:
+                by_tool_fail[tn].append((reason, ln))
+            for tn in sorted(by_tool_fail.keys()):
+                lines.append(f"- `{tn}` × {len(by_tool_fail[tn])}:")
+                for reason, ln in by_tool_fail[tn][:5]:
+                    lines.append(f"  - 第 {ln} 行: {reason}")
+                if len(by_tool_fail[tn]) > 5:
+                    lines.append(f"  - …还有 {len(by_tool_fail[tn]) - 5} 条未列出")
+            lines.append("")
+    else:
+        lines.append("无工具调用。\n")
+
+    lines.append("## 4. 耗时与体积\n")
+    lines.append(f"- 总 wall-clock: **{fmt_duration(wall)}**")
+    if slowest:
+        lines.append("- 最慢的 5 个工具调用:")
+        for d, label, ln in slowest:
+            lines.append(f"  - {label}: {d:,} ms (trace 第 {ln} 行)")
+    if biggest_results:
+        lines.append("- 输出最大的 5 个 tool_result:")
+        for sz, tn, ln in biggest_results:
+            lines.append(f"  - {tn}: {fmt_bytes(sz)} (trace 第 {ln} 行)")
+    lines.append("")
+
+    # 上下文峰值
+    last_ctx = turns_timeline[-1]["context_size"] if turns_timeline else 0
+    lines.append("## 5. 上下文峰值\n")
+    lines.append(f"- **峰值上下文**: {context_peak:,} tokens（在第 {context_peak_turn} 轮 assistant）")
+    lines.append(f"- **最后一轮上下文**: {last_ctx:,} tokens")
+    lines.append(f"- **计算口径**: 单条 assistant 的 `input + cache_read + cache_creation`，近似该轮模型实际看到的总输入。\n")
+
+    # 思考 / 非思考输出
+    lines.append("## 6. 思考 / 输出\n")
+    if total_thinking_chars or total_redacted_blocks:
+        avg_think = total_thinking_chars // total_thinking_blocks if total_thinking_blocks else 0
+        ratio = (total_thinking_chars / total_text_chars) if total_text_chars else float("inf")
+        ratio_str = f"{ratio:.2f}" if total_text_chars else "n/a"
+        lines.append(f"- **思考字符**: {total_thinking_chars:,}（{total_thinking_blocks} 个 thinking 块，平均每块 {avg_think:,} 字符）")
+        if total_redacted_blocks:
+            lines.append(f"- **加密思考块**: {total_redacted_blocks}（内容不可见，仅计数）")
+        lines.append(f"- **非思考输出字符**: {total_text_chars:,}（即对外可见的 text 内容）")
+        lines.append(f"- **思考/输出 字符比**: {ratio_str}")
+        lines.append(f"- **有思考的轮次**: {turns_with_thinking}/{assistant_turns} ({(turns_with_thinking/assistant_turns*100 if assistant_turns else 0):.1f}%)")
+        lines.append("- **说明**: API 把 thinking tokens 计入 `output_tokens`，transcript 不单独透出该数字；本节按字符精确统计，不做 token 换算。\n")
+    else:
+        lines.append(f"- 本会话无 thinking 块（未启用 extended thinking 或模型未触发）。")
+        lines.append(f"- **非思考输出字符**: {total_text_chars:,}（即对外可见的 text 内容）\n")
+
+    # 轮次时间线
+    if turns_timeline:
+        # 折叠相邻 usage 完全相同的重复条目（CC 偶尔会因 retry/streaming flush 写两次）
+        compact = []
+        for t in turns_timeline:
+            if compact:
+                prev = compact[-1]
+                if (prev["tokens"] == t["tokens"]
+                        and prev["context_size"] == t["context_size"]
+                        and prev["model"] == t["model"]
+                        and prev["thinking_chars"] == t["thinking_chars"]
+                        and prev["text_chars"] == t["text_chars"]):
+                    prev["dup_count"] = prev.get("dup_count", 1) + 1
+                    continue
+            compact.append(dict(t, dup_count=1))
+
+        lines.append("## 7. 轮次时间线\n")
+        lines.append("| # | 模型 | 上下文 | 本轮 in/out | 思考字符 | 输出字符 | 工具 | 间隔 | 累计成本 |")
+        lines.append("|--:|------|------:|------------:|--------:|--------:|----:|-----:|---------:|")
+        for t in compact:
+            tk = t["tokens"]
+            in_out = f"{tk.get('input', 0):,} / {tk.get('output', 0):,}"
+            dur = fmt_duration((t['turn_dur_ms'] or 0) / 1000) if t['turn_dur_ms'] is not None else "n/a"
+            label = f"{t['turn']}" + (f" ×{t['dup_count']}" if t['dup_count'] > 1 else "")
+            think_cell = f"{t['thinking_chars']:,}" if t['thinking_chars'] else "·"
+            if t['redacted_thinking_blocks']:
+                think_cell += f" (+{t['redacted_thinking_blocks']}🔒)"
+            text_cell = f"{t['text_chars']:,}" if t['text_chars'] else "·"
+            lines.append(
+                f"| {label} | {t['model']} | {t['context_size']:,} | {in_out} | "
+                f"{think_cell} | {text_cell} | {t['tool_calls']} | {dur} | ${t['cum_cost_usd']:.4f} |"
+            )
+        lines.append("")
+        lines.append("> 「本轮间隔」= 本条 assistant 与上一条 assistant 之间的 wall-clock，包含用户思考与工具执行时间。")
+        lines.append("> 「×N」= CC transcript 里相邻 N 条 assistant 内容完全相同（streaming/retry 产生的重复条目，已折叠）。")
+        lines.append("> 「思考字符」`·` 表示无 thinking 块；`🔒` 表示加密 thinking 块计数。\n")
+
+    lines.append("## 8. 备注\n")
+    lines.append(f"- trace 原始文件: `{jsonl_path}`")
+    lines.append(f"- 归一化 trace: `{trace_path}`")
+    lines.append(f"- 单价表见脚本头部 `PRICING` 常量；未列出的模型不计入成本估算。\n")
+
+    report_path.write_text("\n".join(lines), encoding="utf-8")
+
+    # stdout 三行小结
+    print(f"trace : {trace_path}")
+    print(f"report: {report_path}")
+    print(f"轮次={user_turns}u/{assistant_turns}a  tokens={grand_total:,}  ctx_peak={context_peak:,}  think/out={total_thinking_chars:,}/{total_text_chars:,}字符  耗时={fmt_duration(wall)}  成本=${total_cost:.4f}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="导出当前 Claude Code 会话")
+    ap.add_argument("-s", "--session", help="会话 ID（默认用最近的）")
+    ap.add_argument("-o", "--out", default=".", help="输出根目录（默认当前目录）")
+    ap.add_argument("--list", action="store_true", help="列出最近 10 个会话")
+    args = ap.parse_args()
+
+    sessions = find_sessions()
+    if args.list:
+        print(f"找到 {len(sessions)} 个会话，最近 10 个：")
+        for sid, p, mt in sessions[:10]:
+            t = datetime.fromtimestamp(mt).strftime("%Y-%m-%d %H:%M")
+            size_kb = p.stat().st_size // 1024
+            print(f"  {t}  {size_kb:>5} KB  {sid}  ({p.parent.name})")
+        return
+
+    target = None
+    if args.session:
+        for sid, p, mt in sessions:
+            if sid == args.session or sid.startswith(args.session):
+                target = p
+                break
+        if not target:
+            print(f"未找到会话: {args.session}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        if not sessions:
+            print("没有找到任何会话。", file=sys.stderr)
+            sys.exit(1)
+        target = sessions[0][1]
+
+    sid = target.stem
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    out_dir = Path(args.out).resolve() / f"{sid[:8]}_{stamp}"
+    process(target, out_dir)
+
+
+if __name__ == "__main__":
+    main()
