@@ -13,6 +13,8 @@ Claude Code plugin —— 一键把会话 trace 导出成结构化 `trace.jsonl`
   {"ts":"…","elapsed_ms":3210,"type":"assistant","model":"claude-opus-4-7","tokens":{…},"context_size":52265,"thinking_chars":143,"thinking_blocks":1,"redacted_thinking_blocks":0,"text_chars":598,"summary":"…"}
   ```
 - `report.md` —— 总览（含**上下文峰值** + **思考/输出字符**） / Token 用量表 / 工具调用统计（次数/成功/失败/错误率/min·p50·p95·max 耗时/平均/输入·输出字节） / 失败列表（按工具分组） / 耗时与体积 Top5（最慢工具 + 最大 tool_result） / 上下文峰值章节 / **思考 vs 非思考输出**（精确字符 + 块数 + 字符比，加密思考块单独计数） / 轮次时间线（含每轮 thinking/text 字符列，相邻重复条目自动折叠 ×N） / 估算成本
+- `metrics.json` —— **机器可读的会话指标**，跨会话汇总用。字段与 `hermes-trace-plugin` 完全对齐（`harness` 区分两套）：会话元信息 / 轮数 / tokens（input·output·reasoning·cache_read·cache_write·cache_hit·`max_context_tokens`）/ 思考·输出字符 / 成本 / 工具（总数 + 分工具 calls·ok·fail·总耗时）。
+  > CC 有逐轮 usage，`max_context_tokens` 为**真实峰值**，`max_context_is_approx=false`；`reasoning` 为 `null`（API 把 thinking 计入 output，不单列）。
 
 > **注意**：API 把 thinking tokens 计入 `output_tokens`，transcript 里**没有独立的 thinking_tokens 字段**。本插件只按字符统计思考长度，不做 token 换算，避免误导。
 

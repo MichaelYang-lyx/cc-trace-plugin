@@ -608,9 +608,67 @@ def process(jsonl_path: Path, out_dir: Path):
 
     report_path.write_text("\n".join(lines), encoding="utf-8")
 
-    # stdout 三行小结
-    print(f"trace : {trace_path}")
-    print(f"report: {report_path}")
+    # ---- metrics.json（机器可读，跨会话汇总用；schema 与 hermes-trace 对齐） ----
+    metrics_path = out_dir / "metrics.json"
+    per_tool = {}
+    total_calls = total_ok = total_fail = 0
+    for tn, st in tool_stats.items():
+        per_tool[tn] = {
+            "calls": st["calls"],
+            "ok": st["ok"],
+            "fail": st["fail"],
+            "total_duration_ms": sum(st["durations"]),
+        }
+        total_calls += st["calls"]
+        total_ok += st["ok"]
+        total_fail += st["fail"]
+    cache_write = grand["cache_5m"] + grand["cache_1h"]
+    metrics = {
+        "schema_version": 1,
+        "harness": "claude_code",
+        "session_id": session_id,
+        "title": None,                       # CC transcript 无标题字段
+        "model": ", ".join(by_model_tokens.keys()) or None,
+        "cwd": cwd,
+        "started_at": first_ts.isoformat() if first_ts else None,
+        "ended_at": last_ts.isoformat() if last_ts else None,
+        "duration_s": wall,
+        "turns": {"user": user_turns, "assistant": assistant_turns,
+                  "total": user_turns + assistant_turns},
+        "tokens": {
+            "input": grand["input"],
+            "output": grand["output"],
+            "reasoning": None,               # API 把 thinking 计入 output，不单列
+            "cache_read": grand["cache_read"],
+            "cache_write": cache_write,
+            "cache_hit": grand["cache_read"] > 0,
+            "total_with_cache": grand_total,
+            "max_context_tokens": context_peak,   # CC 有逐轮 usage，真峰值
+            "max_context_is_approx": False,
+        },
+        "thinking": {
+            "reasoning_chars": total_thinking_chars,
+            "output_chars": total_text_chars,
+        },
+        "cost": {
+            "value_usd": round(total_cost, 6),
+            "status": "estimated",
+            "source": "pricing_table",       # 脚本头部 PRICING 常量算出
+        },
+        "tools": {
+            "total_calls": total_calls,
+            "total_ok": total_ok,
+            "total_fail": total_fail,
+            "per_tool": per_tool,
+        },
+    }
+    with open(metrics_path, "w", encoding="utf-8") as mf:
+        json.dump(metrics, mf, ensure_ascii=False, indent=2)
+
+    # stdout 小结
+    print(f"trace  : {trace_path}")
+    print(f"report : {report_path}")
+    print(f"metrics: {metrics_path}")
     print(f"轮次={user_turns}u/{assistant_turns}a  tokens={grand_total:,}  ctx_peak={context_peak:,}  think/out={total_thinking_chars:,}/{total_text_chars:,}字符  耗时={fmt_duration(wall)}  成本=${total_cost:.4f}")
 
 
